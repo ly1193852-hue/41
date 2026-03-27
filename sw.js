@@ -1,4 +1,3 @@
-// sw.js
 const CACHE_NAME = 'kareem-rent-v1';
 const ASSETS = [
     './',
