@@ -308,10 +308,11 @@
   <div class="modal" id="projectModal">
     <div class="modal-box glass">
       <div class="modal-head">
-        <h3>إضافة مشروع</h3>
+        <h3>إضافة/تعديل مشروع</h3>
         <button class="close-btn" data-close-modal><i class="fa-solid fa-xmark"></i></button>
       </div>
       <form id="projectForm" class="form-grid">
+        <input type="hidden" id="projectEditId">
         <label class="field">
           <span>اسم المشروع</span>
           <input type="text" id="projectName" required placeholder="مثال: واجهة بيت السيد علي">
@@ -347,10 +348,11 @@
   <div class="modal" id="expenseModal">
     <div class="modal-box glass">
       <div class="modal-head">
-        <h3>إضافة مصروف</h3>
+        <h3>إضافة/تعديل مصروف</h3>
         <button class="close-btn" data-close-modal><i class="fa-solid fa-xmark"></i></button>
       </div>
       <form id="expenseForm" class="form-grid">
+        <input type="hidden" id="expenseEditId">
         <label class="field">
           <span>المشروع</span>
           <select id="expenseProject" required></select>
@@ -387,10 +389,11 @@
   <div class="modal" id="paymentModal">
     <div class="modal-box glass">
       <div class="modal-head">
-        <h3>إضافة دفعة</h3>
+        <h3>إضافة/تعديل دفعة</h3>
         <button class="close-btn" data-close-modal><i class="fa-solid fa-xmark"></i></button>
       </div>
       <form id="paymentForm" class="form-grid">
+        <input type="hidden" id="paymentEditId">
         <label class="field">
           <span>المشروع</span>
           <select id="paymentProject" required></select>
