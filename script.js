@@ -45,43 +45,50 @@ async function checkAndSync() {
   updateNetworkStatus('syncing');
 
   try {
-    const snapshot = await getDocs(collection(db, "appData"));
-    let serverData = { projects: [], expenses: [], payments: [], debts: [] };
-    
-    snapshot.forEach(document => {
-      serverData[document.id] = document.data().items || [];
-    });
-
-    function mergeData(localArr, serverArr) {
-      const mergedMap = new Map();
-      serverArr.forEach(item => mergedMap.set(item.id, item));
-      localArr.forEach(item => {
-        if (!mergedMap.has(item.id)) {
-          mergedMap.set(item.id, item);
-        } else {
-          const localTime = new Date(item.createdAt).getTime();
-          const serverTime = new Date(mergedMap.get(item.id).createdAt).getTime();
-          if (localTime > serverTime) {
-            mergedMap.set(item.id, item);
-          }
-        }
-      });
-      return Array.from(mergedMap.values());
-    }
-
-    data.projects = mergeData(data.projects, serverData.projects || []);
-    data.expenses = mergeData(data.expenses, serverData.expenses || []);
-    data.payments = mergeData(data.payments, serverData.payments || []);
-    data.debts = mergeData(data.debts, serverData.debts || []);
-    
-    persistLocalOnly();
-
-    const tx = syncDb.transaction("syncQueue", "readwrite");
+    const tx = syncDb.transaction("syncQueue", "readonly");
     const store = tx.objectStore("syncQueue");
     const allReq = store.getAll();
 
     allReq.onsuccess = async () => {
-      if (allReq.result.length > 0) {
+      const queue = allReq.result || [];
+      const deletedIds = new Set(queue.filter(q => q.action === 'delete').map(q => q.id));
+
+      const snapshot = await getDocs(collection(db, "appData"));
+      let serverData = { projects: [], expenses: [], payments: [], debts: [] };
+      
+      snapshot.forEach(document => {
+        serverData[document.id] = document.data().items || [];
+      });
+
+      function mergeData(localArr, serverArr) {
+        const mergedMap = new Map();
+        serverArr.forEach(item => {
+          if (!deletedIds.has(item.id)) {
+            mergedMap.set(item.id, item);
+          }
+        });
+        localArr.forEach(item => {
+          if (!mergedMap.has(item.id)) {
+            mergedMap.set(item.id, item);
+          } else {
+            const localTime = new Date(item.createdAt).getTime();
+            const serverTime = new Date(mergedMap.get(item.id).createdAt).getTime();
+            if (localTime >= serverTime) {
+              mergedMap.set(item.id, item);
+            }
+          }
+        });
+        return Array.from(mergedMap.values());
+      }
+
+      data.projects = mergeData(data.projects, serverData.projects || []);
+      data.expenses = mergeData(data.expenses, serverData.expenses || []);
+      data.payments = mergeData(data.payments, serverData.payments || []);
+      data.debts = mergeData(data.debts, serverData.debts || []);
+      
+      persistLocalOnly();
+
+      if (queue.length > 0) {
         await setDoc(doc(db, "appData", "projects"), { items: data.projects });
         await setDoc(doc(db, "appData", "expenses"), { items: data.expenses });
         await setDoc(doc(db, "appData", "payments"), { items: data.payments });
@@ -90,10 +97,10 @@ async function checkAndSync() {
         const clearTx = syncDb.transaction("syncQueue", "readwrite");
         clearTx.objectStore("syncQueue").clear();
       }
-    };
 
-    updateNetworkStatus('online');
-    renderAll();
+      updateNetworkStatus('online');
+      renderAll();
+    };
   } catch (error) {
     console.error("Sync error:", error);
     updateNetworkStatus('online');
@@ -207,10 +214,22 @@ todayText.textContent = new Date().toLocaleDateString('ar-IQ');
 
 document.querySelectorAll('[data-open-modal]').forEach(btn => {
   btn.addEventListener('click', () => {
-    if (btn.dataset.openModal === 'debtModal') {
+    const modalId = btn.dataset.openModal;
+    if (modalId === 'debtModal') {
       prepareNewDebtForm();
+    } else if (modalId === 'projectModal') {
+      projectForm.reset();
+      document.getElementById('projectEditId').value = '';
+    } else if (modalId === 'expenseModal') {
+      expenseForm.reset();
+      document.getElementById('expenseEditId').value = '';
+      document.getElementById('expenseDate').valueAsDate = new Date();
+    } else if (modalId === 'paymentModal') {
+      paymentForm.reset();
+      document.getElementById('paymentEditId').value = '';
+      document.getElementById('paymentDate').valueAsDate = new Date();
     }
-    openModal(btn.dataset.openModal);
+    openModal(modalId);
   });
 });
 
@@ -231,8 +250,9 @@ navButtons.forEach(btn => {
 projectForm.addEventListener('submit', (e) => {
   e.preventDefault();
 
+  const pId = document.getElementById('projectEditId').value;
   const project = {
-    id: crypto.randomUUID(),
+    id: pId || crypto.randomUUID(),
     name: document.getElementById('projectName').value.trim(),
     type: document.getElementById('projectType').value,
     client: document.getElementById('clientName').value.trim(),
@@ -241,12 +261,20 @@ projectForm.addEventListener('submit', (e) => {
     createdAt: new Date().toISOString()
   };
 
-  data.projects.unshift(project);
+  if (pId) {
+    const index = data.projects.findIndex(item => item.id === pId);
+    if (index !== -1) data.projects[index] = project;
+    showToast('تم تعديل المشروع بنجاح');
+  } else {
+    data.projects.unshift(project);
+    showToast('تم حفظ المشروع بنجاح');
+  }
+
   persist();
-  addToSyncQueue({ action: 'add', type: 'projects', item: project });
+  addToSyncQueue({ action: pId ? 'edit' : 'add', type: 'projects', item: project });
   projectForm.reset();
+  document.getElementById('projectEditId').value = '';
   closeAllModals();
-  showToast('تم حفظ المشروع بنجاح');
   renderAll();
   switchView('projects');
 });
@@ -259,8 +287,9 @@ expenseForm.addEventListener('submit', (e) => {
     return;
   }
 
+  const exId = document.getElementById('expenseEditId').value;
   const expense = {
-    id: crypto.randomUUID(),
+    id: exId || crypto.randomUUID(),
     projectId: expenseProject.value,
     type: document.getElementById('expenseType').value,
     amount: Number(document.getElementById('expenseAmount').value),
@@ -269,13 +298,21 @@ expenseForm.addEventListener('submit', (e) => {
     createdAt: new Date().toISOString()
   };
 
-  data.expenses.unshift(expense);
+  if (exId) {
+    const index = data.expenses.findIndex(item => item.id === exId);
+    if (index !== -1) data.expenses[index] = expense;
+    showToast('تم تعديل المصروف');
+  } else {
+    data.expenses.unshift(expense);
+    showToast('تم حفظ المصروف');
+  }
+
   persist();
-  addToSyncQueue({ action: 'add', type: 'expenses', item: expense });
+  addToSyncQueue({ action: exId ? 'edit' : 'add', type: 'expenses', item: expense });
   expenseForm.reset();
+  document.getElementById('expenseEditId').value = '';
   document.getElementById('expenseDate').valueAsDate = new Date();
   closeAllModals();
-  showToast('تم حفظ المصروف');
   renderAll();
   switchView('expenses');
 });
@@ -288,8 +325,9 @@ paymentForm.addEventListener('submit', (e) => {
     return;
   }
 
+  const payId = document.getElementById('paymentEditId').value;
   const payment = {
-    id: crypto.randomUUID(),
+    id: payId || crypto.randomUUID(),
     projectId: paymentProject.value,
     amount: Number(document.getElementById('paymentAmount').value),
     date: document.getElementById('paymentDate').value,
@@ -297,13 +335,21 @@ paymentForm.addEventListener('submit', (e) => {
     createdAt: new Date().toISOString()
   };
 
-  data.payments.unshift(payment);
+  if (payId) {
+    const index = data.payments.findIndex(item => item.id === payId);
+    if (index !== -1) data.payments[index] = payment;
+    showToast('تم تعديل الدفعة');
+  } else {
+    data.payments.unshift(payment);
+    showToast('تم حفظ الدفعة');
+  }
+
   persist();
-  addToSyncQueue({ action: 'add', type: 'payments', item: payment });
+  addToSyncQueue({ action: payId ? 'edit' : 'add', type: 'payments', item: payment });
   paymentForm.reset();
+  document.getElementById('paymentEditId').value = '';
   document.getElementById('paymentDate').valueAsDate = new Date();
   closeAllModals();
-  showToast('تم حفظ الدفعة');
   renderAll();
   switchView('payments');
 });
@@ -337,7 +383,7 @@ debtForm.addEventListener('submit', (e) => {
     totalRemaining: totals.totalRemaining,
     status: getDebtStatus(totals.totalAmount, totals.totalPaid),
     settlements: getExistingSettlements(debtEditId.value),
-    createdAt: getExistingCreatedAt(debtEditId.value)
+    createdAt: new Date().toISOString()
   };
 
   if (debtEditId.value) {
@@ -377,6 +423,7 @@ settlementForm.addEventListener('submit', (e) => {
   });
 
   applySettlementToDebt(debt, amount);
+  debt.createdAt = new Date().toISOString();
   persist();
   addToSyncQueue({ action: 'set', type: 'debts', item: debt });
   settlementForm.reset();
@@ -617,7 +664,10 @@ function renderProjects() {
 
         <div class="card-actions">
           <button class="small-btn" onclick="openProjectReport('${project.id}')">عرض التقرير</button>
-          <button class="small-btn danger" onclick="deleteProject('${project.id}')">حذف</button>
+          <div style="display:flex; gap:10px;">
+            <button class="small-btn" onclick="editProject('${project.id}')">تعديل</button>
+            <button class="small-btn danger" onclick="deleteProject('${project.id}')">حذف</button>
+          </div>
         </div>
       </article>
     `;
@@ -642,7 +692,10 @@ function renderExpenses() {
       <p>${item.note || 'بدون ملاحظة'}</p>
       <div class="card-actions">
         <strong>${formatMoney(item.amount)}</strong>
-        <button class="small-btn danger" onclick="deleteExpense('${item.id}')">حذف</button>
+        <div style="display:flex; gap:10px;">
+          <button class="small-btn" onclick="editExpense('${item.id}')">تعديل</button>
+          <button class="small-btn danger" onclick="deleteExpense('${item.id}')">حذف</button>
+        </div>
       </div>
     </article>
   `).join('');
@@ -666,7 +719,10 @@ function renderPayments() {
       <p>${item.note || 'بدون ملاحظة'}</p>
       <div class="card-actions">
         <strong>${formatMoney(item.amount)}</strong>
-        <button class="small-btn danger" onclick="deletePayment('${item.id}')">حذف</button>
+        <div style="display:flex; gap:10px;">
+          <button class="small-btn" onclick="editPayment('${item.id}')">تعديل</button>
+          <button class="small-btn danger" onclick="deletePayment('${item.id}')">حذف</button>
+        </div>
       </div>
     </article>
   `).join('');
@@ -970,12 +1026,6 @@ function getExistingSettlements(id) {
   return debt && Array.isArray(debt.settlements) ? debt.settlements : [];
 }
 
-function getExistingCreatedAt(id) {
-  if (!id) return new Date().toISOString();
-  const debt = data.debts.find(item => item.id === id);
-  return debt ? debt.createdAt : new Date().toISOString();
-}
-
 function editDebt(id) {
   const debt = data.debts.find(item => item.id === id);
   if (!debt) return;
@@ -1109,6 +1159,43 @@ window.deleteDebt = deleteDebt;
 window.openProjectReport = openProjectReport;
 window.editDebt = editDebt;
 window.openSettlementModal = openSettlementModal;
+
+window.editProject = function(id) {
+  const project = data.projects.find(item => item.id === id);
+  if (!project) return;
+  document.getElementById('projectEditId').value = project.id;
+  document.getElementById('projectName').value = project.name;
+  document.getElementById('projectType').value = project.type;
+  document.getElementById('clientName').value = project.client;
+  document.getElementById('projectBudget').value = project.budget;
+  document.getElementById('projectNotes').value = project.notes;
+  openModal('projectModal');
+};
+
+window.editExpense = function(id) {
+  const expense = data.expenses.find(item => item.id === id);
+  if (!expense) return;
+  updateProjectOptions();
+  document.getElementById('expenseEditId').value = expense.id;
+  document.getElementById('expenseProject').value = expense.projectId;
+  document.getElementById('expenseType').value = expense.type;
+  document.getElementById('expenseAmount').value = expense.amount;
+  document.getElementById('expenseDate').value = expense.date;
+  document.getElementById('expenseNote').value = expense.note;
+  openModal('expenseModal');
+};
+
+window.editPayment = function(id) {
+  const payment = data.payments.find(item => item.id === id);
+  if (!payment) return;
+  updateProjectOptions();
+  document.getElementById('paymentEditId').value = payment.id;
+  document.getElementById('paymentProject').value = payment.projectId;
+  document.getElementById('paymentAmount').value = payment.amount;
+  document.getElementById('paymentDate').value = payment.date;
+  document.getElementById('paymentNote').value = payment.note;
+  openModal('paymentModal');
+};
 
 prepareNewDebtForm();
 renderAll();
