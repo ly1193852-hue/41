@@ -1,1201 +1,981 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
-import { getFirestore, collection, getDocs, doc, setDoc } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, doc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyC2sHZ1MukRHA2dt6aABBQfinA7FH0Sfj4",
-  authDomain: "lkkkk-bf0c2.firebaseapp.com",
-  projectId: "lkkkk-bf0c2",
-  storageBucket: "lkkkk-bf0c2.firebasestorage.app",
-  messagingSenderId: "533029601422",
-  appId: "1:533029601422:web:659aebe1eeac1f4cdcc9df"
+    apiKey: "AIzaSyClhb_-h8A25NcRkt7q-Jm15HkIQX2NoEs",
+    authDomain: "kiui-3527b.firebaseapp.com",
+    projectId: "kiui-3527b",
+    storageBucket: "kiui-3527b.firebasestorage.app",
+    messagingSenderId: "174501891120",
+    appId: "1:174501891120:web:aa6a83eb7c776f88aa71f5"
 };
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
-const STORAGE_KEY = 'constructionManagerAppData';
-const defaultData = { projects: [], expenses: [], payments: [], debts: [] };
+let currentInventory = 1;
+let currentRentInventory = 1; 
+let currentCustomerId = null;
+let isOnline = navigator.onLine;
 
-let data = loadData();
-
-const syncDbName = "OfflineSyncDB";
-let syncDb;
-const request = indexedDB.open(syncDbName, 1);
-request.onupgradeneeded = e => {
-  syncDb = e.target.result;
-  syncDb.createObjectStore("syncQueue", { autoIncrement: true });
-};
-request.onsuccess = e => {
-  syncDb = e.target.result;
-  checkAndSync();
+let data = {
+    inventory1: [],
+    inventory2: [],
+    customers: [],
+    transactions: [],
+    lastSync: 0
 };
 
-function addToSyncQueue(operationData) {
-  if (!syncDb) return;
-  const tx = syncDb.transaction("syncQueue", "readwrite");
-  tx.objectStore("syncQueue").add(operationData);
-  checkAndSync();
+let syncQueue = [];
+
+const DB_NAME = 'kareemDB';
+const DB_VERSION = 1;
+
+function openDB() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains('store')) {
+                db.createObjectStore('store');
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
 }
 
-async function checkAndSync() {
-  if (!navigator.onLine) {
-    updateNetworkStatus('offline');
-    return;
-  }
-  updateNetworkStatus('syncing');
+async function getLocalData(key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction('store', 'readonly');
+        const store = tx.objectStore('store');
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
 
-  try {
-    const tx = syncDb.transaction("syncQueue", "readonly");
-    const store = tx.objectStore("syncQueue");
-    const allReq = store.getAll();
+async function setLocalData(key, value) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction('store', 'readwrite');
+        const store = tx.objectStore('store');
+        const req = store.put(value, key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+    });
+}
 
-    allReq.onsuccess = async () => {
-      const queue = allReq.result || [];
-      const deletedIds = new Set(queue.filter(q => q.action === 'delete').map(q => q.id));
+async function initData() {
+    const localData = await getLocalData('kareemData');
+    const localQueue = await getLocalData('syncQueue');
+    if (localData) data = localData;
+    if (localQueue) syncQueue = localQueue;
+    
+    if (isOnline) {
+        await syncData();
+    } else {
+        updateNetworkStatus('offline');
+        renderUI();
+    }
+}
 
-      const snapshot = await getDocs(collection(db, "appData"));
-      let serverData = { projects: [], expenses: [], payments: [], debts: [] };
-      
-      snapshot.forEach(document => {
-        serverData[document.id] = document.data().items || [];
-      });
+async function saveDataLocally() {
+    data.lastUpdated = Date.now();
+    await setLocalData('kareemData', data);
+    if (isOnline) {
+        addToQueue('sync');
+        processQueue();
+    } else {
+        addToQueue('sync');
+    }
+}
 
-      function mergeData(localArr, serverArr) {
-        const mergedMap = new Map();
-        serverArr.forEach(item => {
-          if (!deletedIds.has(item.id)) {
-            mergedMap.set(item.id, item);
-          }
-        });
-        localArr.forEach(item => {
-          if (!mergedMap.has(item.id)) {
-            mergedMap.set(item.id, item);
-          } else {
-            const localTime = new Date(item.createdAt).getTime();
-            const serverTime = new Date(mergedMap.get(item.id).createdAt).getTime();
-            if (localTime >= serverTime) {
-              mergedMap.set(item.id, item);
-            }
-          }
-        });
-        return Array.from(mergedMap.values());
-      }
+function addToQueue(action) {
+    syncQueue.push({ action, timestamp: Date.now() });
+    setLocalData('syncQueue', syncQueue);
+}
 
-      data.projects = mergeData(data.projects, serverData.projects || []);
-      data.expenses = mergeData(data.expenses, serverData.expenses || []);
-      data.payments = mergeData(data.payments, serverData.payments || []);
-      data.debts = mergeData(data.debts, serverData.debts || []);
-      
-      persistLocalOnly();
-
-      if (queue.length > 0) {
-        await setDoc(doc(db, "appData", "projects"), { items: data.projects });
-        await setDoc(doc(db, "appData", "expenses"), { items: data.expenses });
-        await setDoc(doc(db, "appData", "payments"), { items: data.payments });
-        await setDoc(doc(db, "appData", "debts"), { items: data.debts });
+async function syncData() {
+    updateNetworkStatus('syncing');
+    try {
+        const docRef = doc(db, "data", "main");
+        const docSnap = await getDoc(docRef);
         
-        const clearTx = syncDb.transaction("syncQueue", "readwrite");
-        clearTx.objectStore("syncQueue").clear();
-      }
+        if (docSnap.exists()) {
+            const serverData = docSnap.data();
+            mergeData(serverData);
+        }
+        
+        await setDoc(docRef, data);
+        syncQueue = [];
+        await setLocalData('syncQueue', syncQueue);
+        updateNetworkStatus('online');
+        renderUI();
+    } catch (e) {
+        updateNetworkStatus('offline');
+    }
+}
 
-      updateNetworkStatus('online');
-      renderAll();
+function mergeData(serverData) {
+    const mergeArray = (localArr, serverArr) => {
+        const map = new Map();
+        if(serverArr) serverArr.forEach(item => map.set(item.id, item));
+        if(localArr) localArr.forEach(item => {
+            if (!map.has(item.id) || (item.lastUpdated && map.get(item.id).lastUpdated && item.lastUpdated > map.get(item.id).lastUpdated)) {
+                map.set(item.id, item);
+            }
+        });
+        return Array.from(map.values());
     };
-  } catch (error) {
-    console.error("Sync error:", error);
-    updateNetworkStatus('online');
-  }
+
+    data.inventory1 = mergeArray(data.inventory1 || [], serverData.inventory1 || []);
+    data.inventory2 = mergeArray(data.inventory2 || [], serverData.inventory2 || []);
+    data.customers = mergeArray(data.customers || [], serverData.customers || []);
+    data.transactions = mergeArray(data.transactions || [], serverData.transactions || []);
+    data.lastSync = Date.now();
+    setLocalData('kareemData', data);
+}
+
+async function processQueue() {
+    if (!isOnline || syncQueue.length === 0) return;
+    await syncData();
 }
 
 function updateNetworkStatus(status) {
-  const badge = document.getElementById('networkStatus');
-  badge.className = 'status-badge ' + status;
-  if (status === 'online') badge.innerHTML = '<i class="fa-solid fa-wifi"></i> متصل';
-  else if (status === 'offline') badge.innerHTML = '<i class="fa-solid fa-plane-slash"></i> أوفلاين';
-  else if (status === 'syncing') badge.innerHTML = '<i class="fa-solid fa-rotate"></i> جاري المزامنة...';
+    const el = document.getElementById('network-status');
+    el.className = `network-status ${status}`;
+    if (status === 'online') el.innerText = 'متصل';
+    if (status === 'offline') el.innerText = 'غير متصل';
+    if (status === 'syncing') el.innerText = 'جاري المزامنة...';
 }
 
-window.addEventListener('online', checkAndSync);
-window.addEventListener('offline', () => updateNetworkStatus('offline'));
+window.addEventListener('online', () => { isOnline = true; processQueue(); });
+window.addEventListener('offline', () => { isOnline = false; updateNetworkStatus('offline'); });
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(err => console.log('SW Error:', err));
-  });
+    navigator.serviceWorker.register('sw.js');
 }
 
 let deferredPrompt;
 window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  deferredPrompt = e;
-  document.getElementById('installAppBtn').style.display = 'inline-flex';
+    e.preventDefault();
+    deferredPrompt = e;
+    document.getElementById('install-prompt').style.display = 'block';
 });
 
-document.getElementById('installAppBtn').addEventListener('click', async () => {
-  if (deferredPrompt) {
+window.installApp = function() {
+    document.getElementById('install-prompt').style.display = 'none';
     deferredPrompt.prompt();
-    const { outcome } = await deferredPrompt.userChoice;
-    if (outcome === 'accepted') {
-      document.getElementById('installAppBtn').style.display = 'none';
-    }
     deferredPrompt = null;
-  }
-});
+};
 
-function checkPassword() {
-  if (sessionStorage.getItem('appUnlocked') !== 'true') {
-    document.getElementById('passwordOverlay').style.display = 'flex';
-  } else {
-    document.getElementById('passwordOverlay').style.display = 'none';
-  }
+window.closeInstallPrompt = function() {
+    document.getElementById('install-prompt').style.display = 'none';
+};
+
+function formatIQD(number) {
+    return new Intl.NumberFormat('en-IQ').format(number);
 }
 
-document.getElementById('appPasswordBtn').addEventListener('click', () => {
-  if (document.getElementById('appPasswordInput').value === '1968') {
-    sessionStorage.setItem('appUnlocked', 'true');
-    document.getElementById('passwordOverlay').style.display = 'none';
-  } else {
-    document.getElementById('appPasswordError').style.display = 'block';
-  }
-});
-
-checkPassword();
-updateNetworkStatus(navigator.onLine ? 'online' : 'offline');
-
-const views = document.querySelectorAll('.view');
-const navButtons = document.querySelectorAll('.nav-btn');
-const modals = document.querySelectorAll('.modal');
-
-const projectsCount = document.getElementById('projectsCount');
-const paymentsTotal = document.getElementById('paymentsTotal');
-const expensesTotal = document.getElementById('expensesTotal');
-const profitTotal = document.getElementById('profitTotal');
-const recentActivity = document.getElementById('recentActivity');
-const projectsList = document.getElementById('projectsList');
-const expensesList = document.getElementById('expensesList');
-const paymentsList = document.getElementById('paymentsList');
-const debtsList = document.getElementById('debtsList');
-const reportProjectSelect = document.getElementById('reportProjectSelect');
-const reportCard = document.getElementById('reportCard');
-const todayText = document.getElementById('todayText');
-
-const debtsTotal = document.getElementById('debtsTotal');
-const debtsLaborTotal = document.getElementById('debtsLaborTotal');
-const debtsMaterialsTotal = document.getElementById('debtsMaterialsTotal');
-const debtsPaidTotal = document.getElementById('debtsPaidTotal');
-const debtsRemainingTotal = document.getElementById('debtsRemainingTotal');
-
-const projectForm = document.getElementById('projectForm');
-const expenseForm = document.getElementById('expenseForm');
-const paymentForm = document.getElementById('paymentForm');
-const debtForm = document.getElementById('debtForm');
-const settlementForm = document.getElementById('settlementForm');
-
-const expenseProject = document.getElementById('expenseProject');
-const paymentProject = document.getElementById('paymentProject');
-const debtProject = document.getElementById('debtProject');
-const debtType = document.getElementById('debtType');
-const debtItemsContainer = document.getElementById('debtItemsContainer');
-const debtItemTemplate = document.getElementById('debtItemTemplate');
-const debtEditId = document.getElementById('debtEditId');
-const debtModalTitle = document.getElementById('debtModalTitle');
-
-const debtSearchInput = document.getElementById('debtSearchInput');
-const debtFilterProject = document.getElementById('debtFilterProject');
-const debtFilterType = document.getElementById('debtFilterType');
-const debtFilterStatus = document.getElementById('debtFilterStatus');
-
-document.getElementById('expenseDate').valueAsDate = new Date();
-document.getElementById('paymentDate').valueAsDate = new Date();
-document.getElementById('debtDate').valueAsDate = new Date();
-document.getElementById('settlementDate').valueAsDate = new Date();
-
-todayText.textContent = new Date().toLocaleDateString('ar-IQ');
-
-document.querySelectorAll('[data-open-modal]').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const modalId = btn.dataset.openModal;
-    if (modalId === 'debtModal') {
-      prepareNewDebtForm();
-    } else if (modalId === 'projectModal') {
-      projectForm.reset();
-      document.getElementById('projectEditId').value = '';
-    } else if (modalId === 'expenseModal') {
-      expenseForm.reset();
-      document.getElementById('expenseEditId').value = '';
-      document.getElementById('expenseDate').valueAsDate = new Date();
-    } else if (modalId === 'paymentModal') {
-      paymentForm.reset();
-      document.getElementById('paymentEditId').value = '';
-      document.getElementById('paymentDate').valueAsDate = new Date();
-    }
-    openModal(modalId);
-  });
-});
-
-document.querySelectorAll('[data-close-modal]').forEach(btn => {
-  btn.addEventListener('click', closeAllModals);
-});
-
-modals.forEach(modal => {
-  modal.addEventListener('click', (e) => {
-    if (e.target.classList.contains('modal')) closeAllModals();
-  });
-});
-
-navButtons.forEach(btn => {
-  btn.addEventListener('click', () => switchView(btn.dataset.view));
-});
-
-projectForm.addEventListener('submit', (e) => {
-  e.preventDefault();
-
-  const pId = document.getElementById('projectEditId').value;
-  const project = {
-    id: pId || crypto.randomUUID(),
-    name: document.getElementById('projectName').value.trim(),
-    type: document.getElementById('projectType').value,
-    client: document.getElementById('clientName').value.trim(),
-    budget: Number(document.getElementById('projectBudget').value),
-    notes: document.getElementById('projectNotes').value.trim(),
-    createdAt: new Date().toISOString()
-  };
-
-  if (pId) {
-    const index = data.projects.findIndex(item => item.id === pId);
-    if (index !== -1) data.projects[index] = project;
-    showToast('تم تعديل المشروع بنجاح');
-  } else {
-    data.projects.unshift(project);
-    showToast('تم حفظ المشروع بنجاح');
-  }
-
-  persist();
-  addToSyncQueue({ action: pId ? 'edit' : 'add', type: 'projects', item: project });
-  projectForm.reset();
-  document.getElementById('projectEditId').value = '';
-  closeAllModals();
-  renderAll();
-  switchView('projects');
-});
-
-expenseForm.addEventListener('submit', (e) => {
-  e.preventDefault();
-
-  if (!data.projects.length) {
-    showToast('أضف مشروع أولاً');
-    return;
-  }
-
-  const exId = document.getElementById('expenseEditId').value;
-  const expense = {
-    id: exId || crypto.randomUUID(),
-    projectId: expenseProject.value,
-    type: document.getElementById('expenseType').value,
-    amount: Number(document.getElementById('expenseAmount').value),
-    date: document.getElementById('expenseDate').value,
-    note: document.getElementById('expenseNote').value.trim(),
-    createdAt: new Date().toISOString()
-  };
-
-  if (exId) {
-    const index = data.expenses.findIndex(item => item.id === exId);
-    if (index !== -1) data.expenses[index] = expense;
-    showToast('تم تعديل المصروف');
-  } else {
-    data.expenses.unshift(expense);
-    showToast('تم حفظ المصروف');
-  }
-
-  persist();
-  addToSyncQueue({ action: exId ? 'edit' : 'add', type: 'expenses', item: expense });
-  expenseForm.reset();
-  document.getElementById('expenseEditId').value = '';
-  document.getElementById('expenseDate').valueAsDate = new Date();
-  closeAllModals();
-  renderAll();
-  switchView('expenses');
-});
-
-paymentForm.addEventListener('submit', (e) => {
-  e.preventDefault();
-
-  if (!data.projects.length) {
-    showToast('أضف مشروع أولاً');
-    return;
-  }
-
-  const payId = document.getElementById('paymentEditId').value;
-  const payment = {
-    id: payId || crypto.randomUUID(),
-    projectId: paymentProject.value,
-    amount: Number(document.getElementById('paymentAmount').value),
-    date: document.getElementById('paymentDate').value,
-    note: document.getElementById('paymentNote').value.trim(),
-    createdAt: new Date().toISOString()
-  };
-
-  if (payId) {
-    const index = data.payments.findIndex(item => item.id === payId);
-    if (index !== -1) data.payments[index] = payment;
-    showToast('تم تعديل الدفعة');
-  } else {
-    data.payments.unshift(payment);
-    showToast('تم حفظ الدفعة');
-  }
-
-  persist();
-  addToSyncQueue({ action: payId ? 'edit' : 'add', type: 'payments', item: payment });
-  paymentForm.reset();
-  document.getElementById('paymentEditId').value = '';
-  document.getElementById('paymentDate').valueAsDate = new Date();
-  closeAllModals();
-  renderAll();
-  switchView('payments');
-});
-
-debtForm.addEventListener('submit', (e) => {
-  e.preventDefault();
-
-  if (!data.projects.length) {
-    showToast('أضف مشروع أولاً');
-    return;
-  }
-
-  const items = readDebtItems();
-  if (!items.length) {
-    showToast('أضف عنصر دين واحد على الأقل');
-    return;
-  }
-
-  const totals = calculateDebtTotals(items);
-  const debt = {
-    id: debtEditId.value || crypto.randomUUID(),
-    projectId: debtProject.value,
-    date: document.getElementById('debtDate').value,
-    creditorName: document.getElementById('debtCreditorName').value.trim(),
-    debtType: debtType.value,
-    title: document.getElementById('debtTitle').value.trim(),
-    notes: document.getElementById('debtNotes').value.trim(),
-    items,
-    totalAmount: totals.totalAmount,
-    totalPaid: totals.totalPaid,
-    totalRemaining: totals.totalRemaining,
-    status: getDebtStatus(totals.totalAmount, totals.totalPaid),
-    settlements: getExistingSettlements(debtEditId.value),
-    createdAt: new Date().toISOString()
-  };
-
-  if (debtEditId.value) {
-    const index = data.debts.findIndex(item => item.id === debtEditId.value);
-    if (index !== -1) data.debts[index] = debt;
-    showToast('تم تعديل الدين');
-  } else {
-    data.debts.unshift(debt);
-    showToast('تم حفظ الدين');
-  }
-
-  persist();
-  addToSyncQueue({ action: 'set', type: 'debts', item: debt });
-  closeAllModals();
-  renderAll();
-  switchView('debts');
-});
-
-settlementForm.addEventListener('submit', (e) => {
-  e.preventDefault();
-
-  const debtId = document.getElementById('settlementDebtId').value;
-  const amount = Number(document.getElementById('settlementAmount').value);
-  const date = document.getElementById('settlementDate').value;
-  const note = document.getElementById('settlementNote').value.trim();
-
-  const debt = data.debts.find(item => item.id === debtId);
-  if (!debt) return;
-
-  debt.settlements = Array.isArray(debt.settlements) ? debt.settlements : [];
-  debt.settlements.unshift({
-    id: crypto.randomUUID(),
-    amount,
-    date,
-    note,
-    createdAt: new Date().toISOString()
-  });
-
-  applySettlementToDebt(debt, amount);
-  debt.createdAt = new Date().toISOString();
-  persist();
-  addToSyncQueue({ action: 'set', type: 'debts', item: debt });
-  settlementForm.reset();
-  document.getElementById('settlementDate').valueAsDate = new Date();
-  closeAllModals();
-  renderAll();
-  showToast('تم حفظ التسديد');
-});
-
-document.getElementById('exportBtn').addEventListener('click', exportData);
-document.getElementById('importInput').addEventListener('change', importData);
-document.getElementById('clearDataBtn').addEventListener('click', clearData);
-document.getElementById('addDebtItemBtn').addEventListener('click', () => addDebtItemRow());
-
-debtSearchInput.addEventListener('input', renderDebts);
-debtFilterProject.addEventListener('change', renderDebts);
-debtFilterType.addEventListener('change', renderDebts);
-debtFilterStatus.addEventListener('change', renderDebts);
-reportProjectSelect.addEventListener('change', renderReport);
-debtType.addEventListener('change', updateDebtItemPlaceholders);
-
-function loadData() {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (!saved) return structuredClone(defaultData);
-    const parsed = JSON.parse(saved);
-    return {
-      projects: Array.isArray(parsed.projects) ? parsed.projects : [],
-      expenses: Array.isArray(parsed.expenses) ? parsed.expenses : [],
-      payments: Array.isArray(parsed.payments) ? parsed.payments : [],
-      debts: Array.isArray(parsed.debts) ? parsed.debts : []
-    };
-  } catch (error) {
-    console.error('Load error', error);
-    return structuredClone(defaultData);
-  }
-}
-
-function persistLocalOnly() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-}
-
-function persist() {
-  persistLocalOnly();
-}
-
-function openModal(id) {
-  if ((id === 'expenseModal' || id === 'paymentModal' || id === 'debtModal') && !data.projects.length) {
-    showToast('يجب إضافة مشروع أولاً');
-    return;
-  }
-  document.getElementById(id).classList.add('show');
-  updateProjectOptions();
-}
-
-function closeAllModals() {
-  modals.forEach(modal => modal.classList.remove('show'));
-}
-
-function switchView(viewId) {
-  views.forEach(view => view.classList.toggle('active', view.id === viewId));
-  navButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.view === viewId));
-}
-
-function formatMoney(value) {
-  return new Intl.NumberFormat('ar-IQ').format(Number(value || 0)) + ' د.ع';
-}
-
-function getProjectName(id) {
-  const project = data.projects.find(p => p.id === id);
-  return project ? project.name : 'مشروع غير معروف';
-}
-
-function projectPaymentsTotal(projectId) {
-  return data.payments
-    .filter(item => item.projectId === projectId)
-    .reduce((sum, item) => sum + item.amount, 0);
-}
-
-function projectExpensesTotal(projectId) {
-  return data.expenses
-    .filter(item => item.projectId === projectId)
-    .reduce((sum, item) => sum + item.amount, 0);
-}
-
-function projectDebtsTotal(projectId) {
-  return data.debts
-    .filter(item => item.projectId === projectId)
-    .reduce((sum, item) => sum + Number(item.totalAmount || 0), 0);
-}
-
-function projectDebtsPaidTotal(projectId) {
-  return data.debts
-    .filter(item => item.projectId === projectId)
-    .reduce((sum, item) => sum + Number(item.totalPaid || 0), 0);
-}
-
-function projectDebtsRemainingTotal(projectId) {
-  return data.debts
-    .filter(item => item.projectId === projectId)
-    .reduce((sum, item) => sum + Number(item.totalRemaining || 0), 0);
-}
-
-function deleteProject(id) {
-  if (!confirm('هل تريد حذف هذا المشروع وكل ما يتعلق به؟')) return;
-
-  data.projects = data.projects.filter(project => project.id !== id);
-  data.expenses = data.expenses.filter(item => item.projectId !== id);
-  data.payments = data.payments.filter(item => item.projectId !== id);
-  data.debts = data.debts.filter(item => item.projectId !== id);
-  persist();
-  addToSyncQueue({ action: 'delete', type: 'projects', id: id });
-  renderAll();
-  showToast('تم حذف المشروع');
-}
-
-function deleteExpense(id) {
-  if (!confirm('حذف هذا المصروف؟')) return;
-  data.expenses = data.expenses.filter(item => item.id !== id);
-  persist();
-  addToSyncQueue({ action: 'delete', type: 'expenses', id: id });
-  renderAll();
-  showToast('تم حذف المصروف');
-}
-
-function deletePayment(id) {
-  if (!confirm('حذف هذه الدفعة؟')) return;
-  data.payments = data.payments.filter(item => item.id !== id);
-  persist();
-  addToSyncQueue({ action: 'delete', type: 'payments', id: id });
-  renderAll();
-  showToast('تم حذف الدفعة');
-}
-
-function deleteDebt(id) {
-  if (!confirm('حذف هذا الدين؟')) return;
-  data.debts = data.debts.filter(item => item.id !== id);
-  persist();
-  addToSyncQueue({ action: 'delete', type: 'debts', id: id });
-  renderAll();
-  showToast('تم حذف الدين');
-}
-
-function renderDashboard() {
-  const totalPayments = data.payments.reduce((sum, item) => sum + item.amount, 0);
-  const totalExpenses = data.expenses.reduce((sum, item) => sum + item.amount, 0);
-  const totalProfit = totalPayments - totalExpenses;
-
-  projectsCount.textContent = data.projects.length;
-  paymentsTotal.textContent = formatMoney(totalPayments);
-  expensesTotal.textContent = formatMoney(totalExpenses);
-  profitTotal.textContent = formatMoney(totalProfit);
-
-  const activities = [
-    ...data.payments.map(item => ({
-      type: 'دفعة',
-      amount: item.amount,
-      date: item.date,
-      projectId: item.projectId,
-      createdAt: item.createdAt
-    })),
-    ...data.expenses.map(item => ({
-      type: 'مصروف',
-      amount: item.amount,
-      date: item.date,
-      projectId: item.projectId,
-      createdAt: item.createdAt
-    })),
-    ...data.debts.map(item => ({
-      type: 'دين',
-      amount: item.totalAmount,
-      date: item.date,
-      projectId: item.projectId,
-      createdAt: item.createdAt
-    }))
-  ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 5);
-
-  if (!activities.length) {
-    recentActivity.className = 'list-wrap empty-state';
-    recentActivity.textContent = 'لا توجد عمليات بعد';
-    return;
-  }
-
-  recentActivity.className = 'list-wrap';
-  recentActivity.innerHTML = activities.map(item => `
-    <div class="activity-item">
-      <div>
-        <strong>${item.type}</strong>
-        <div class="muted">${getProjectName(item.projectId)}</div>
-      </div>
-      <div>
-        <strong>${formatMoney(item.amount)}</strong>
-        <div class="muted">${item.date || ''}</div>
-      </div>
-    </div>
-  `).join('');
-}
-
-function renderProjects() {
-  if (!data.projects.length) {
-    projectsList.innerHTML = '<div class="empty-state glass">لا توجد مشاريع مضافة حاليًا</div>';
-    return;
-  }
-
-  projectsList.innerHTML = data.projects.map(project => {
-    const income = projectPaymentsTotal(project.id);
-    const expense = projectExpensesTotal(project.id);
-    const net = income - expense;
-
-    return `
-      <article class="project-card glass">
-        <div class="card-top">
-          <div>
-            <h3>${project.name}</h3>
-            <div class="muted">الزبون: ${project.client}</div>
-          </div>
-          <span class="tag">${project.type}</span>
-        </div>
-
-        <div class="inline-stats">
-          <div class="mini-box">
-            <span>المبلغ الكلي</span>
-            <strong>${formatMoney(project.budget)}</strong>
-          </div>
-          <div class="mini-box">
-            <span>الداخل</span>
-            <strong>${formatMoney(income)}</strong>
-          </div>
-          <div class="mini-box">
-            <span>الخارج</span>
-            <strong>${formatMoney(expense)}</strong>
-          </div>
-          <div class="mini-box">
-            <span>الصافي</span>
-            <strong>${formatMoney(net)}</strong>
-          </div>
-        </div>
-
-        <div class="card-actions">
-          <button class="small-btn" onclick="openProjectReport('${project.id}')">عرض التقرير</button>
-          <div style="display:flex; gap:10px;">
-            <button class="small-btn" onclick="editProject('${project.id}')">تعديل</button>
-            <button class="small-btn danger" onclick="deleteProject('${project.id}')">حذف</button>
-          </div>
-        </div>
-      </article>
-    `;
-  }).join('');
-}
-
-function renderExpenses() {
-  if (!data.expenses.length) {
-    expensesList.innerHTML = '<div class="empty-state glass">لا توجد مصاريف مسجلة</div>';
-    return;
-  }
-
-  expensesList.innerHTML = data.expenses.map(item => `
-    <article class="record-card glass">
-      <div class="record-meta">
-        <div>
-          <h3>${item.type}</h3>
-          <div class="muted">${getProjectName(item.projectId)}</div>
-        </div>
-        <span class="tag">${item.date}</span>
-      </div>
-      <p>${item.note || 'بدون ملاحظة'}</p>
-      <div class="card-actions">
-        <strong>${formatMoney(item.amount)}</strong>
-        <div style="display:flex; gap:10px;">
-          <button class="small-btn" onclick="editExpense('${item.id}')">تعديل</button>
-          <button class="small-btn danger" onclick="deleteExpense('${item.id}')">حذف</button>
-        </div>
-      </div>
-    </article>
-  `).join('');
-}
-
-function renderPayments() {
-  if (!data.payments.length) {
-    paymentsList.innerHTML = '<div class="empty-state glass">لا توجد دفعات مسجلة</div>';
-    return;
-  }
-
-  paymentsList.innerHTML = data.payments.map(item => `
-    <article class="record-card glass">
-      <div class="record-meta">
-        <div>
-          <h3>دفعة مستلمة</h3>
-          <div class="muted">${getProjectName(item.projectId)}</div>
-        </div>
-        <span class="tag">${item.date}</span>
-      </div>
-      <p>${item.note || 'بدون ملاحظة'}</p>
-      <div class="card-actions">
-        <strong>${formatMoney(item.amount)}</strong>
-        <div style="display:flex; gap:10px;">
-          <button class="small-btn" onclick="editPayment('${item.id}')">تعديل</button>
-          <button class="small-btn danger" onclick="deletePayment('${item.id}')">حذف</button>
-        </div>
-      </div>
-    </article>
-  `).join('');
-}
-
-function renderDebtsSummary() {
-  const total = data.debts.reduce((sum, item) => sum + Number(item.totalAmount || 0), 0);
-  const labor = data.debts
-    .filter(item => item.debtType === 'أجور عمل')
-    .reduce((sum, item) => sum + Number(item.totalAmount || 0), 0);
-  const materials = data.debts
-    .filter(item => item.debtType === 'مواد')
-    .reduce((sum, item) => sum + Number(item.totalAmount || 0), 0);
-  const paid = data.debts.reduce((sum, item) => sum + Number(item.totalPaid || 0), 0);
-  const remaining = data.debts.reduce((sum, item) => sum + Number(item.totalRemaining || 0), 0);
-
-  debtsTotal.textContent = formatMoney(total);
-  debtsLaborTotal.textContent = formatMoney(labor);
-  debtsMaterialsTotal.textContent = formatMoney(materials);
-  debtsPaidTotal.textContent = formatMoney(paid);
-  debtsRemainingTotal.textContent = formatMoney(remaining);
-}
-
-function renderDebts() {
-  renderDebtsSummary();
-
-  if (!data.debts.length) {
-    debtsList.innerHTML = '<div class="empty-state glass">لا توجد ديون مسجلة</div>';
-    return;
-  }
-
-  const search = debtSearchInput.value.trim().toLowerCase();
-  const filterProject = debtFilterProject.value;
-  const filterType = debtFilterType.value;
-  const filterStatus = debtFilterStatus.value;
-
-  const filtered = data.debts.filter(item => {
-    const haystack = [
-      getProjectName(item.projectId),
-      item.creditorName,
-      item.debtType,
-      item.title,
-      ...(Array.isArray(item.items) ? item.items.map(sub => `${sub.name} ${sub.role} ${sub.note || ''}`) : [])
-    ].join(' ').toLowerCase();
-
-    const matchesSearch = !search || haystack.includes(search);
-    const matchesProject = !filterProject || item.projectId === filterProject;
-    const matchesType = !filterType || item.debtType === filterType;
-    const matchesStatus = !filterStatus || item.status === filterStatus;
-
-    return matchesSearch && matchesProject && matchesType && matchesStatus;
-  });
-
-  if (!filtered.length) {
-    debtsList.innerHTML = '<div class="empty-state glass">لا توجد نتائج مطابقة</div>';
-    return;
-  }
-
-  debtsList.innerHTML = filtered.map(item => {
-    const statusClass = item.status === 'غير مسدد'
-      ? 'status-unpaid'
-      : item.status === 'مسدد جزئيًا'
-        ? 'status-partial'
-        : 'status-paid';
-
-    const itemsHtml = (item.items || []).map(sub => `
-      <div class="debt-card-item">
-        <div class="debt-card-topline">
-          <strong>${sub.name || '-'}</strong>
-          <span class="tag">${sub.role || '-'}</span>
-        </div>
-        <div class="debt-summary-line">
-          <div class="mini-box"><span>الكمية / الأيام</span><strong>${sub.quantity || 0}</strong></div>
-          <div class="mini-box"><span>السعر / الأجر</span><strong>${formatMoney(sub.price || 0)}</strong></div>
-          <div class="mini-box"><span>المبلغ</span><strong>${formatMoney(sub.total || 0)}</strong></div>
-          <div class="mini-box"><span>المتبقي</span><strong>${formatMoney(sub.remaining || 0)}</strong></div>
-        </div>
-        <div class="muted">${sub.note || 'بدون ملاحظة'}</div>
-      </div>
-    `).join('');
-
-    return `
-      <article class="record-card glass">
-        <div class="debt-card-head">
-          <div>
-            <h3>${item.title}</h3>
-            <div class="muted">${getProjectName(item.projectId)} - ${item.creditorName}</div>
-          </div>
-          <div class="debt-card-topline">
-            <span class="tag">${item.debtType}</span>
-            <span class="status-badge ${statusClass}">${item.status}</span>
-          </div>
-        </div>
-
-        <div class="debt-card-details">
-          <div class="debt-summary-line">
-            <div class="mini-box"><span>المبلغ الكلي</span><strong>${formatMoney(item.totalAmount)}</strong></div>
-            <div class="mini-box"><span>المدفوع</span><strong>${formatMoney(item.totalPaid)}</strong></div>
-            <div class="mini-box"><span>المتبقي</span><strong>${formatMoney(item.totalRemaining)}</strong></div>
-            <div class="mini-box"><span>التاريخ</span><strong>${item.date || '-'}</strong></div>
-          </div>
-          <div class="muted">${item.notes || 'بدون ملاحظات'}</div>
-          <div class="debt-card-items">${itemsHtml}</div>
-        </div>
-
-        <div class="card-actions">
-          <button class="small-btn" onclick="editDebt('${item.id}')">تعديل</button>
-          <button class="small-btn" onclick="openSettlementModal('${item.id}')">تسديد دفعة</button>
-          <button class="small-btn danger" onclick="deleteDebt('${item.id}')">حذف</button>
-        </div>
-      </article>
-    `;
-  }).join('');
-}
-
-function updateProjectOptions() {
-  const options = data.projects.map(project => `<option value="${project.id}">${project.name}</option>`).join('');
-  expenseProject.innerHTML = options;
-  paymentProject.innerHTML = options;
-  debtProject.innerHTML = options;
-
-  reportProjectSelect.innerHTML = data.projects.length
-    ? data.projects.map(project => `<option value="${project.id}">${project.name}</option>`).join('')
-    : '<option value="">لا توجد مشاريع</option>';
-
-  debtFilterProject.innerHTML = data.projects.length
-    ? `<option value="">الكل</option>${data.projects.map(project => `<option value="${project.id}">${project.name}</option>`).join('')}`
-    : '<option value="">الكل</option>';
-}
-
-function renderReport() {
-  updateProjectOptions();
-
-  if (!data.projects.length) {
-    reportCard.innerHTML = '<div class="empty-state">أضف مشروعًا حتى يظهر التقرير</div>';
-    return;
-  }
-
-  const projectId = reportProjectSelect.value || data.projects[0].id;
-  reportProjectSelect.value = projectId;
-
-  const project = data.projects.find(item => item.id === projectId);
-  const income = projectPaymentsTotal(projectId);
-  const expense = projectExpensesTotal(projectId);
-  const net = income - expense;
-  const remaining = (project.budget || 0) - income;
-  const debtsAmount = projectDebtsTotal(projectId);
-  const debtsPaid = projectDebtsPaidTotal(projectId);
-  const debtsRemaining = projectDebtsRemainingTotal(projectId);
-
-  reportCard.innerHTML = `
-    <div class="report-box">
-      <h3>${project.name}</h3>
-      <p class="muted">الزبون: ${project.client} | النوع: ${project.type}</p>
-    </div>
-    <div class="report-box"><strong>المبلغ الكلي:</strong> ${formatMoney(project.budget)}</div>
-    <div class="report-box"><strong>إجمالي الدفعات:</strong> ${formatMoney(income)}</div>
-    <div class="report-box"><strong>إجمالي المصاريف:</strong> ${formatMoney(expense)}</div>
-    <div class="report-box"><strong>صافي الربح:</strong> ${formatMoney(net)}</div>
-    <div class="report-box"><strong>المتبقي من الزبون:</strong> ${formatMoney(remaining)}</div>
-    <div class="report-box"><strong>إجمالي ديون المشروع:</strong> ${formatMoney(debtsAmount)}</div>
-    <div class="report-box"><strong>المسدد من ديون المشروع:</strong> ${formatMoney(debtsPaid)}</div>
-    <div class="report-box"><strong>المتبقي من ديون المشروع:</strong> ${formatMoney(debtsRemaining)}</div>
-    <div class="report-box"><strong>الملاحظات:</strong> ${project.notes || 'لا توجد ملاحظات'}</div>
-  `;
-}
-
-function openProjectReport(projectId) {
-  switchView('reports');
-  updateProjectOptions();
-  reportProjectSelect.value = projectId;
-  renderReport();
-}
-
-function prepareNewDebtForm() {
-  debtForm.reset();
-  debtEditId.value = '';
-  debtModalTitle.textContent = 'إضافة دين';
-  debtItemsContainer.innerHTML = '';
-  document.getElementById('debtDate').valueAsDate = new Date();
-  addDebtItemRow();
-  updateDebtTotalsDisplay();
-  updateDebtItemPlaceholders();
-}
-
-function addDebtItemRow(item = {}) {
-  const fragment = debtItemTemplate.content.cloneNode(true);
-  const row = fragment.querySelector('.debt-item-row');
-
-  const nameInput = row.querySelector('.debt-item-name');
-  const roleInput = row.querySelector('.debt-item-role');
-  const quantityInput = row.querySelector('.debt-item-quantity');
-  const priceInput = row.querySelector('.debt-item-price');
-  const paidInput = row.querySelector('.debt-item-paid');
-  const noteInput = row.querySelector('.debt-item-note');
-  const totalText = row.querySelector('.debt-item-total-text');
-  const remainingText = row.querySelector('.debt-item-remaining-text');
-  const removeBtn = row.querySelector('.remove-debt-item-btn');
-
-  nameInput.value = item.name || '';
-  roleInput.value = item.role || '';
-  quantityInput.value = item.quantity ?? 1;
-  priceInput.value = item.price ?? 0;
-  paidInput.value = item.paid ?? 0;
-  noteInput.value = item.note || '';
-
-  function refreshRow() {
-    const quantity = Number(quantityInput.value || 0);
-    const price = Number(priceInput.value || 0);
-    const paid = Number(paidInput.value || 0);
-    const total = quantity * price;
-    const remaining = Math.max(total - paid, 0);
-
-    row.dataset.total = total;
-    row.dataset.remaining = remaining;
-    totalText.textContent = formatMoney(total);
-    remainingText.textContent = formatMoney(remaining);
-    updateDebtTotalsDisplay();
-  }
-
-  [quantityInput, priceInput, paidInput].forEach(input => {
-    input.addEventListener('input', refreshRow);
-  });
-
-  removeBtn.addEventListener('click', () => {
-    row.remove();
-    if (!debtItemsContainer.children.length) addDebtItemRow();
-    updateDebtTotalsDisplay();
-  });
-
-  debtItemsContainer.appendChild(row);
-  refreshRow();
-  updateDebtItemPlaceholders();
-}
-
-function updateDebtItemPlaceholders() {
-  const typeValue = debtType.value;
-  debtItemsContainer.querySelectorAll('.debt-item-row').forEach(row => {
-    const nameInput = row.querySelector('.debt-item-name');
-    const roleInput = row.querySelector('.debt-item-role');
-    const quantityLabel = row.querySelectorAll('.field span')[2];
-    const priceLabel = row.querySelectorAll('.field span')[3];
-
-    if (typeValue === 'أجور عمل') {
-      nameInput.placeholder = 'اسم العامل أو الشخص';
-      roleInput.placeholder = 'فني أو عامل أو معلم';
-      quantityLabel.textContent = 'عدد الأيام';
-      priceLabel.textContent = 'الأجر اليومي';
-    } else if (typeValue === 'مواد') {
-      nameInput.placeholder = 'اسم المادة';
-      roleInput.placeholder = 'الوحدة مثل متر أو قطعة';
-      quantityLabel.textContent = 'الكمية';
-      priceLabel.textContent = 'السعر';
+window.checkPassword = function() {
+    const pass = document.getElementById('password-input').value;
+    if (pass === "1001") {
+        document.getElementById('login-screen').classList.remove('active');
+        document.getElementById('main-app').classList.add('active');
+        window.switchTab('tab-customers'); 
     } else {
-      nameInput.placeholder = 'الاسم أو المادة';
-      roleInput.placeholder = 'الصفة أو الوحدة';
-      quantityLabel.textContent = 'الكمية / الأيام';
-      priceLabel.textContent = 'السعر / الأجر';
+        alert("كلمة المرور خاطئة");
     }
-  });
 }
 
-function readDebtItems() {
-  return [...debtItemsContainer.querySelectorAll('.debt-item-row')].map(row => {
-    const name = row.querySelector('.debt-item-name').value.trim();
-    const role = row.querySelector('.debt-item-role').value.trim();
-    const quantity = Number(row.querySelector('.debt-item-quantity').value || 0);
-    const price = Number(row.querySelector('.debt-item-price').value || 0);
-    const paid = Number(row.querySelector('.debt-item-paid').value || 0);
-    const note = row.querySelector('.debt-item-note').value.trim();
-    const total = quantity * price;
-    const remaining = Math.max(total - paid, 0);
+window.switchTab = function(tabId) {
+    document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('active'));
+    
+    document.getElementById(tabId).classList.add('active');
+    document.getElementById(tabId.replace('tab-', 'nav-')).classList.add('active');
 
-    return { name, role, quantity, price, total, paid, remaining, note };
-  }).filter(item => item.name || item.role || item.quantity || item.price || item.paid || item.note);
+    if(tabId === 'tab-inventory') {
+        document.getElementById('search-inventory').value = '';
+        window.renderInventory();
+    }
+    if(tabId === 'tab-customers') {
+        document.getElementById('search-customer').value = '';
+        document.getElementById('customers-main-view').style.display = 'block';
+        document.getElementById('customer-details-view').style.display = 'none';
+        window.renderCustomers();
+    }
+    if(tabId === 'tab-alerts') window.renderAlerts();
 }
 
-function calculateDebtTotals(items) {
-  const totalAmount = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
-  const totalPaid = items.reduce((sum, item) => sum + Number(item.paid || 0), 0);
-  const totalRemaining = items.reduce((sum, item) => sum + Number(item.remaining || 0), 0);
-  return { totalAmount, totalPaid, totalRemaining };
+window.openModal = function(modalId) {
+    document.getElementById(modalId).classList.add('active');
+}
+window.closeModal = function(modalId) {
+    document.getElementById(modalId).classList.remove('active');
 }
 
-function updateDebtTotalsDisplay() {
-  const totals = calculateDebtTotals(readDebtItems());
-  document.getElementById('debtTotalAmount').textContent = formatMoney(totals.totalAmount);
-  document.getElementById('debtTotalPaid').textContent = formatMoney(totals.totalPaid);
-  document.getElementById('debtTotalRemaining').textContent = formatMoney(totals.totalRemaining);
+window.switchInventory = function(num) {
+    currentInventory = num;
+    document.getElementById('btn-inv-1').classList.remove('active');
+    document.getElementById('btn-inv-2').classList.remove('active');
+    document.getElementById(`btn-inv-${num}`).classList.add('active');
+    document.getElementById('current-inv-label').innerText = num;
+    document.getElementById('search-inventory').value = ''; 
+    window.renderInventory();
 }
 
-function getDebtStatus(totalAmount, totalPaid) {
-  if (Number(totalPaid) <= 0) return 'غير مسدد';
-  if (Number(totalPaid) >= Number(totalAmount)) return 'مسدد بالكامل';
-  return 'مسدد جزئيًا';
+window.saveItem = async function() {
+    const name = document.getElementById('item-name').value;
+    const price = parseFloat(document.getElementById('item-price').value);
+    const qty = parseInt(document.getElementById('item-qty').value);
+
+    if (!name || isNaN(price) || isNaN(qty)) {
+        alert("يرجى تعبئة جميع الحقول بشكل صحيح"); return;
+    }
+
+    const newItem = { id: Date.now(), name, price, qty, lastUpdated: Date.now() };
+    
+    if (currentInventory === 1) data.inventory1.push(newItem);
+    else data.inventory2.push(newItem);
+
+    await saveDataLocally();
+    window.closeModal('addItemModal');
+    
+    document.getElementById('item-name').value = '';
+    document.getElementById('item-price').value = '';
+    document.getElementById('item-qty').value = '';
+    
+    window.searchInventory();
 }
 
-function getExistingSettlements(id) {
-  if (!id) return [];
-  const debt = data.debts.find(item => item.id === id);
-  return debt && Array.isArray(debt.settlements) ? debt.settlements : [];
+window.searchInventory = function() {
+    const query = document.getElementById('search-inventory').value.toLowerCase().trim();
+    window.renderInventory(query);
 }
 
-function editDebt(id) {
-  const debt = data.debts.find(item => item.id === id);
-  if (!debt) return;
+window.openEditModal = function(id, invNum) {
+    const items = invNum === 1 ? data.inventory1 : data.inventory2;
+    const item = items.find(i => i.id === id);
 
-  updateProjectOptions();
-  debtEditId.value = debt.id;
-  debtModalTitle.textContent = 'تعديل دين';
-  document.getElementById('debtDate').value = debt.date || '';
-  document.getElementById('debtCreditorName').value = debt.creditorName || '';
-  debtType.value = debt.debtType || 'أجور عمل';
-  document.getElementById('debtTitle').value = debt.title || '';
-  document.getElementById('debtNotes').value = debt.notes || '';
-  debtProject.value = debt.projectId || '';
-
-  debtItemsContainer.innerHTML = '';
-  (debt.items || []).forEach(item => addDebtItemRow(item));
-  if (!debtItemsContainer.children.length) addDebtItemRow();
-
-  updateDebtTotalsDisplay();
-  updateDebtItemPlaceholders();
-  openModal('debtModal');
+    if (item) {
+        document.getElementById('edit-item-id').value = id;
+        document.getElementById('edit-item-inv').value = invNum;
+        document.getElementById('edit-item-name').value = item.name;
+        document.getElementById('edit-item-price').value = item.price;
+        document.getElementById('edit-item-qty').value = item.qty;
+        
+        window.openModal('editItemModal');
+    }
 }
 
-function openSettlementModal(id) {
-  const debt = data.debts.find(item => item.id === id);
-  if (!debt) return;
-  document.getElementById('settlementDebtId').value = id;
-  document.getElementById('settlementAmount').value = debt.totalRemaining || 0;
-  document.getElementById('settlementDate').valueAsDate = new Date();
-  document.getElementById('settlementNote').value = '';
-  openModal('settlementModal');
+window.saveEditItem = async function() {
+    const id = parseInt(document.getElementById('edit-item-id').value);
+    const invNum = parseInt(document.getElementById('edit-item-inv').value);
+    const name = document.getElementById('edit-item-name').value;
+    const price = parseFloat(document.getElementById('edit-item-price').value);
+    const qty = parseInt(document.getElementById('edit-item-qty').value);
+
+    if (!name || isNaN(price) || isNaN(qty)) {
+        alert("يرجى تعبئة جميع الحقول بشكل صحيح"); return;
+    }
+
+    const items = invNum === 1 ? data.inventory1 : data.inventory2;
+    const itemIndex = items.findIndex(i => i.id === id);
+
+    if (itemIndex > -1) {
+        items[itemIndex].name = name;
+        items[itemIndex].price = price;
+        items[itemIndex].qty = qty;
+        items[itemIndex].lastUpdated = Date.now();
+        
+        await saveDataLocally();
+        window.closeModal('editItemModal');
+        window.searchInventory();
+    }
 }
 
-function applySettlementToDebt(debt, amount) {
-  let remainingToApply = Number(amount || 0);
+window.deleteItem = async function(id, invNum) {
+    if(confirm("هل أنت متأكد من حذف هذه المادة؟")) {
+        if(invNum === 1) data.inventory1 = data.inventory1.filter(item => item.id !== id);
+        else data.inventory2 = data.inventory2.filter(item => item.id !== id);
+        await saveDataLocally();
+        window.searchInventory();
+    }
+}
 
-  debt.items = (debt.items || []).map(item => {
-    const currentRemaining = Math.max(Number(item.total || 0) - Number(item.paid || 0), 0);
-    if (remainingToApply <= 0 || currentRemaining <= 0) return item;
+window.renderInventory = function(searchQuery = '') {
+    const list = document.getElementById('inventory-list');
+    list.innerHTML = '';
+    let items = currentInventory === 1 ? data.inventory1 : data.inventory2;
 
-    const applied = Math.min(currentRemaining, remainingToApply);
-    const nextPaid = Number(item.paid || 0) + applied;
-    const nextRemaining = Math.max(Number(item.total || 0) - nextPaid, 0);
+    if (searchQuery) {
+        items = items.filter(item => item.name.toLowerCase().startsWith(searchQuery));
+    }
 
-    remainingToApply -= applied;
+    if(items.length === 0 && searchQuery !== '') {
+        list.innerHTML = '<p style="text-align:center; color:#7f8c8d; padding: 20px;">لا توجد مواد تطابق بحثك.</p>';
+        return;
+    }
 
-    return {
-      ...item,
-      paid: nextPaid,
-      remaining: nextRemaining
+    items.forEach(item => {
+        list.innerHTML += `
+            <div class="card">
+                <div class="card-info">
+                    <h4>${item.name}</h4>
+                    <p>السعر: ${formatIQD(item.price)} د.ع</p>
+                    <p>الكمية المتوفرة: ${item.qty}</p>
+                </div>
+                <div class="card-actions">
+                    <button class="btn-warning btn-small" onclick="window.openEditModal(${item.id}, ${currentInventory})">تعديل</button>
+                    <button class="btn-danger btn-small" onclick="window.deleteItem(${item.id}, ${currentInventory})">حذف</button>
+                </div>
+            </div>
+        `;
+    });
+}
+
+window.searchCustomer = function() {
+    const query = document.getElementById('search-customer').value.toLowerCase().trim();
+    window.renderCustomers(query);
+}
+
+window.saveCustomer = async function() {
+    const name = document.getElementById('cust-name').value;
+    const phone = document.getElementById('cust-phone').value;
+
+    if (!name || !phone) { alert("يرجى إدخال الاسم والرقم"); return; }
+
+    const newCustomer = {
+        id: Date.now(),
+        name: name,
+        phone: "964" + phone,
+        balance: 0,
+        lastUpdated: Date.now()
     };
-  });
 
-  const totals = calculateDebtTotals(debt.items);
-  debt.totalAmount = totals.totalAmount;
-  debt.totalPaid = totals.totalPaid;
-  debt.totalRemaining = totals.totalRemaining;
-  debt.status = getDebtStatus(debt.totalAmount, debt.totalPaid);
+    data.customers.push(newCustomer);
+    await saveDataLocally();
+    window.closeModal('addCustomerModal');
+    
+    document.getElementById('cust-name').value = '';
+    document.getElementById('cust-phone').value = '';
+    
+    window.searchCustomer();
 }
 
-function exportData() {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
-  link.download = 'construction-backup.json';
-  link.click();
-  URL.revokeObjectURL(link.href);
-  showToast('تم تصدير النسخة الاحتياطية');
-}
-
-function importData(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const imported = JSON.parse(reader.result);
-      data = {
-        projects: Array.isArray(imported.projects) ? imported.projects : [],
-        expenses: Array.isArray(imported.expenses) ? imported.expenses : [],
-        payments: Array.isArray(imported.payments) ? imported.payments : [],
-        debts: Array.isArray(imported.debts) ? imported.debts : []
-      };
-      persist();
-      addToSyncQueue({ action: 'full_sync', data: data });
-      renderAll();
-      showToast('تم استيراد البيانات بنجاح');
-    } catch (error) {
-      console.error(error);
-      showToast('ملف غير صالح');
+window.openEditCustomerModal = function(id) {
+    const customer = data.customers.find(c => c.id === id);
+    if (customer) {
+        document.getElementById('edit-cust-id').value = customer.id;
+        document.getElementById('edit-cust-name').value = customer.name;
+        document.getElementById('edit-cust-phone').value = customer.phone.replace(/^964/, ''); 
+        
+        window.openModal('editCustomerModal');
     }
-  };
-  reader.readAsText(file);
-  event.target.value = '';
 }
 
-function clearData() {
-  if (!confirm('هل أنت متأكد من حذف جميع البيانات؟')) return;
-  data = structuredClone(defaultData);
-  persist();
-  addToSyncQueue({ action: 'full_sync', data: data });
-  renderAll();
-  showToast('تم حذف جميع البيانات');
+window.saveEditCustomer = async function() {
+    const id = parseInt(document.getElementById('edit-cust-id').value);
+    const name = document.getElementById('edit-cust-name').value;
+    const phone = document.getElementById('edit-cust-phone').value;
+
+    if (!name || !phone) { alert("يرجى إدخال الاسم والرقم"); return; }
+
+    const customerIndex = data.customers.findIndex(c => c.id === id);
+    if (customerIndex > -1) {
+        data.customers[customerIndex].name = name;
+        data.customers[customerIndex].phone = "964" + phone;
+        data.customers[customerIndex].lastUpdated = Date.now();
+        
+        await saveDataLocally();
+        window.closeModal('editCustomerModal');
+        window.searchCustomer();
+    }
 }
 
-function showToast(message) {
-  const toast = document.getElementById('toast');
-  toast.textContent = message;
-  toast.classList.add('show');
-  clearTimeout(showToast.timer);
-  showToast.timer = setTimeout(() => {
-    toast.classList.remove('show');
-  }, 2200);
+window.renderCustomers = function(searchQuery = '') {
+    const list = document.getElementById('customers-list');
+    list.innerHTML = '';
+    
+    let filteredCustomers = data.customers;
+    if(searchQuery) {
+        filteredCustomers = filteredCustomers.filter(cust => cust.name.toLowerCase().startsWith(searchQuery));
+    }
+
+    filteredCustomers.forEach(cust => {
+        list.innerHTML += `
+            <div class="card" onclick="window.openCustomerDetails(${cust.id})">
+                <div class="card-info">
+                    <h4>${cust.name}</h4>
+                    <p>الرقم: +${cust.phone}</p>
+                </div>
+                <div class="card-actions">
+                    <button class="btn-warning btn-small" onclick="event.stopPropagation(); window.openEditCustomerModal(${cust.id})">تعديل</button>
+                    <button class="btn-danger btn-small" onclick="event.stopPropagation(); window.deleteCustomer(${cust.id})">حذف</button>
+                </div>
+            </div>
+        `;
+    });
 }
 
-function renderAll() {
-  updateProjectOptions();
-  renderDashboard();
-  renderProjects();
-  renderExpenses();
-  renderPayments();
-  renderDebts();
-  renderReport();
+window.deleteCustomer = async function(id) {
+    if(confirm("هل أنت متأكد من حذف هذا الزبون؟")) {
+        data.customers = data.customers.filter(c => c.id !== id);
+        await saveDataLocally();
+        window.searchCustomer();
+    }
 }
 
-window.deleteProject = deleteProject;
-window.deleteExpense = deleteExpense;
-window.deletePayment = deletePayment;
-window.deleteDebt = deleteDebt;
-window.openProjectReport = openProjectReport;
-window.editDebt = editDebt;
-window.openSettlementModal = openSettlementModal;
+window.openCustomerDetails = function(id) {
+    currentCustomerId = id;
+    const customer = data.customers.find(c => c.id === id);
+    
+    document.getElementById('customers-main-view').style.display = 'none';
+    document.getElementById('customer-details-view').style.display = 'block';
+    
+    document.getElementById('detail-customer-name').innerText = customer.name;
+    document.getElementById('detail-customer-phone').innerText = "+" + customer.phone;
+    document.getElementById('detail-customer-phone').href = "tel:+" + customer.phone;
 
-window.editProject = function(id) {
-  const project = data.projects.find(item => item.id === id);
-  if (!project) return;
-  document.getElementById('projectEditId').value = project.id;
-  document.getElementById('projectName').value = project.name;
-  document.getElementById('projectType').value = project.type;
-  document.getElementById('clientName').value = project.client;
-  document.getElementById('projectBudget').value = project.budget;
-  document.getElementById('projectNotes').value = project.notes;
-  openModal('projectModal');
-};
+    window.updateCustomerBalanceDisplay(customer);
+    window.renderTransactions();
+}
 
-window.editExpense = function(id) {
-  const expense = data.expenses.find(item => item.id === id);
-  if (!expense) return;
-  updateProjectOptions();
-  document.getElementById('expenseEditId').value = expense.id;
-  document.getElementById('expenseProject').value = expense.projectId;
-  document.getElementById('expenseType').value = expense.type;
-  document.getElementById('expenseAmount').value = expense.amount;
-  document.getElementById('expenseDate').value = expense.date;
-  document.getElementById('expenseNote').value = expense.note;
-  openModal('expenseModal');
-};
+window.backToCustomers = function() {
+    document.getElementById('customers-main-view').style.display = 'block';
+    document.getElementById('customer-details-view').style.display = 'none';
+    currentCustomerId = null;
+    window.searchCustomer();
+}
 
-window.editPayment = function(id) {
-  const payment = data.payments.find(item => item.id === id);
-  if (!payment) return;
-  updateProjectOptions();
-  document.getElementById('paymentEditId').value = payment.id;
-  document.getElementById('paymentProject').value = payment.projectId;
-  document.getElementById('paymentAmount').value = payment.amount;
-  document.getElementById('paymentDate').value = payment.date;
-  document.getElementById('paymentNote').value = payment.note;
-  openModal('paymentModal');
-};
+window.updateCustomerBalanceDisplay = function(customer) {
+    document.getElementById('detail-customer-balance').innerText = `${formatIQD(customer.balance)} د.ع`;
+}
 
-prepareNewDebtForm();
-renderAll();
+window.savePayment = async function() {
+    const amount = parseFloat(document.getElementById('payment-amount').value);
+    if(isNaN(amount) || amount <= 0) return;
+
+    const customer = data.customers.find(c => c.id === currentCustomerId);
+    customer.balance -= amount;
+    customer.lastUpdated = Date.now();
+
+    const now = new Date();
+    data.transactions.push({
+        id: Date.now(),
+        customerId: currentCustomerId,
+        type: 'payment',
+        amount: amount,
+        date: now.toLocaleDateString('ar-IQ'),
+        time: now.toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit', hour12: true }),
+        lastUpdated: Date.now()
+    });
+
+    await saveDataLocally();
+    window.closeModal('paymentModal');
+    document.getElementById('payment-amount').value = '';
+    window.updateCustomerBalanceDisplay(customer);
+    window.renderTransactions();
+}
+
+window.changeRentInventory = function(num) {
+    currentRentInventory = num;
+    document.getElementById('btn-rent-inv-1').classList.remove('active');
+    document.getElementById('btn-rent-inv-2').classList.remove('active');
+    document.getElementById(`btn-rent-inv-${num}`).classList.add('active');
+    
+    const searches = document.querySelectorAll('.rent-item-search');
+    searches.forEach(search => {
+        search.value = '';
+    });
+    const prices = document.querySelectorAll('.rent-item-price');
+    prices.forEach(price => {
+        price.value = '0';
+    });
+}
+
+window.openRentModal = function() {
+    window.changeRentInventory(1);
+    document.getElementById('rent-items-container').innerHTML = '';
+    document.getElementById('rent-paid').value = '';
+    window.addRentItemRow(); 
+    window.openModal('rentModal');
+}
+
+window.filterRentItems = function(input, rowId) {
+    const query = input.value.toLowerCase().trim();
+    const dropdown = document.getElementById(`dropdown-${rowId}`);
+    const items = currentRentInventory === 1 ? data.inventory1 : data.inventory2;
+    
+    dropdown.innerHTML = '';
+    
+    let filtered = items;
+    if (query) {
+        filtered = items.filter(item => item.name.toLowerCase().startsWith(query));
+    }
+
+    if (filtered.length === 0) {
+        dropdown.style.display = 'none';
+        return;
+    }
+
+    filtered.forEach(item => {
+        const div = document.createElement('div');
+        div.style.padding = '10px';
+        div.style.borderBottom = '1px solid #eee';
+        div.style.cursor = 'pointer';
+        div.innerText = `${item.name} (${formatIQD(item.price)} د.ع)`;
+        div.onclick = function() {
+            input.value = item.name;
+            document.getElementById(`price-${rowId}`).value = item.price;
+            dropdown.style.display = 'none';
+        };
+        dropdown.appendChild(div);
+    });
+    
+    dropdown.style.display = 'block';
+}
+
+document.addEventListener('click', function(e) {
+    if (!e.target.classList.contains('rent-item-search')) {
+        document.querySelectorAll('.rent-item-dropdown').forEach(d => d.style.display = 'none');
+    }
+});
+
+window.addRentItemRow = function() {
+    const container = document.getElementById('rent-items-container');
+    const rowId = Date.now();
+    
+    const rowHTML = `
+        <div class="rent-item-row" id="row-${rowId}">
+            <div style="position: relative; flex: 1;">
+                <input type="text" id="search-${rowId}" class="rent-item-search" placeholder="ابحث عن مادة..." onkeyup="window.filterRentItems(this, ${rowId})" onfocus="window.filterRentItems(this, ${rowId})" autocomplete="off" style="margin-bottom:0;">
+                <input type="hidden" id="price-${rowId}" class="rent-item-price" value="0">
+                <div id="dropdown-${rowId}" class="rent-item-dropdown" style="display:none; position:absolute; background:white; width:100%; border:1px solid #bdc3c7; border-radius:4px; max-height:150px; overflow-y:auto; z-index:100; top:100%;"></div>
+            </div>
+            <input type="number" placeholder="الكمية" value="1" min="1" class="rent-item-qty" style="width: 70px; margin-bottom:0;">
+            <button class="btn-danger btn-small" onclick="document.getElementById('row-${rowId}').remove();">X</button>
+        </div>
+    `;
+    container.insertAdjacentHTML('beforeend', rowHTML);
+}
+
+window.saveRentalTransaction = async function() {
+    const paid = parseFloat(document.getElementById('rent-paid').value) || 0;
+    const customer = data.customers.find(c => c.id === currentCustomerId);
+
+    let itemsText = [];
+    let itemsArray = [];
+    let canRent = true;
+
+    const searches = document.querySelectorAll('.rent-item-search');
+    const qtys = document.querySelectorAll('.rent-item-qty');
+    const prices = document.querySelectorAll('.rent-item-price');
+    
+    const nowTimestamp = Date.now();
+
+    searches.forEach((search, index) => {
+        if(search.value.trim() !== '') {
+            const itemName = search.value.trim();
+            const qty = parseInt(qtys[index].value) || 1;
+            const price = parseFloat(prices[index].value) || 0;
+            
+            let foundItem = data.inventory1.find(i => i.name === itemName);
+            let invType = 1;
+            if(!foundItem) {
+                foundItem = data.inventory2.find(i => i.name === itemName);
+                invType = 2;
+            }
+
+            if(foundItem) {
+                if(foundItem.qty < qty) {
+                    canRent = false;
+                } else {
+                    itemsArray.push({
+                        id: foundItem.id,
+                        name: foundItem.name,
+                        qty: qty,
+                        price: price,
+                        invType: invType,
+                        returnedQty: 0,
+                        rentTimestamp: nowTimestamp
+                    });
+                    itemsText.push(`${itemName} (عدد ${qty})`);
+                }
+            } else {
+                 canRent = false;
+            }
+        }
+    });
+
+    if(!canRent) {
+        alert("المخزون لا يكفي أو المادة غير موجودة!");
+        return;
+    }
+
+    itemsArray.forEach(item => {
+        if(item.invType === 1) {
+            let invItem = data.inventory1.find(i => i.id === item.id);
+            if(invItem) { invItem.qty -= item.qty; invItem.lastUpdated = nowTimestamp; }
+        } else {
+            let invItem = data.inventory2.find(i => i.id === item.id);
+            if(invItem) { invItem.qty -= item.qty; invItem.lastUpdated = nowTimestamp; }
+        }
+    });
+
+    customer.balance -= paid;
+    customer.lastUpdated = nowTimestamp;
+
+    const now = new Date();
+    const rawDate = now.toISOString().split('T')[0];
+    const rawTime = now.toTimeString().slice(0, 5);
+
+    const transaction = {
+        id: nowTimestamp,
+        customerId: currentCustomerId,
+        type: 'rent',
+        items: itemsText.join(' + '),
+        itemsArray: itemsArray,
+        totalCost: 0,
+        paid: paid,
+        date: now.toLocaleDateString('ar-IQ'),
+        time: now.toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit', hour12: true }),
+        rawDate: rawDate,
+        rawTime: rawTime,
+        status: 'ongoing',
+        returnHistory: [],
+        lastUpdated: nowTimestamp
+    };
+
+    data.transactions.push(transaction);
+    await saveDataLocally();
+    window.closeModal('rentModal');
+    window.updateCustomerBalanceDisplay(customer);
+    window.renderTransactions();
+    window.renderInventory();
+}
+
+window.deleteTransaction = async function(id) {
+    if(confirm("هل أنت متأكد من حذف هذه المعاملة؟ سيتم التراجع عن تأثيرها في حساب الزبون.")) {
+        const trans = data.transactions.find(t => t.id === id);
+        const customer = data.customers.find(c => c.id === trans.customerId);
+        
+        if (trans.type === 'rent') {
+            let netImpact = (trans.totalCost || 0) - (trans.paid || 0);
+            if(trans.remaining !== undefined) netImpact = trans.remaining;
+            customer.balance -= netImpact;
+
+            if(trans.itemsArray) {
+                trans.itemsArray.forEach(item => {
+                    const unreturnedQty = item.qty - item.returnedQty;
+                    if(unreturnedQty > 0) {
+                        if(item.invType === 1) {
+                            let invItem = data.inventory1.find(i => i.id === item.id);
+                            if(invItem) invItem.qty += unreturnedQty;
+                        } else {
+                            let invItem = data.inventory2.find(i => i.id === item.id);
+                            if(invItem) invItem.qty += unreturnedQty;
+                        }
+                    }
+                });
+            }
+        } else if (trans.type === 'payment') {
+            customer.balance += trans.amount; 
+        }
+        
+        customer.lastUpdated = Date.now();
+        data.transactions = data.transactions.filter(t => t.id !== id);
+        await saveDataLocally();
+        window.updateCustomerBalanceDisplay(customer);
+        window.renderTransactions();
+        window.renderInventory();
+    }
+}
+
+window.openEditTransactionModal = function(id) {
+    const trans = data.transactions.find(t => t.id === id);
+    if(trans && trans.type === 'rent') {
+        document.getElementById('edit-trans-id').value = id;
+        document.getElementById('edit-trans-items').value = trans.items || (trans.itemsArray ? trans.itemsArray.map(i=>`${i.name}(${i.qty})`).join(', ') : '');
+        document.getElementById('edit-trans-date').value = trans.rawDate || '';
+        document.getElementById('edit-trans-time').value = trans.rawTime || '';
+        document.getElementById('edit-trans-days').value = trans.days || 0;
+        
+        const dailyRate = trans.days > 0 ? ((trans.total || trans.totalCost) / trans.days) : 0;
+        document.getElementById('edit-trans-days').dataset.dailyRate = dailyRate;
+        
+        document.getElementById('edit-trans-total').value = trans.total || trans.totalCost || 0;
+        document.getElementById('edit-trans-paid').value = trans.paid || 0;
+        window.openModal('editTransactionModal');
+    }
+}
+
+window.updateEditTotal = function() {
+    const daysInput = document.getElementById('edit-trans-days');
+    const dailyRate = parseFloat(daysInput.dataset.dailyRate) || 0;
+    const newDays = parseInt(daysInput.value) || 0;
+    document.getElementById('edit-trans-total').value = dailyRate * newDays;
+}
+
+window.saveEditTransaction = async function() {
+    const id = parseInt(document.getElementById('edit-trans-id').value);
+    const trans = data.transactions.find(t => t.id === id);
+    const customer = data.customers.find(c => c.id === trans.customerId);
+    
+    const newItems = document.getElementById('edit-trans-items').value;
+    const newDate = document.getElementById('edit-trans-date').value;
+    const newTime = document.getElementById('edit-trans-time').value;
+    const newDays = parseInt(document.getElementById('edit-trans-days').value) || trans.days;
+    const newTotal = parseFloat(document.getElementById('edit-trans-total').value) || 0;
+    const newPaid = parseFloat(document.getElementById('edit-trans-paid').value) || 0;
+    
+    let oldNet = trans.remaining !== undefined ? trans.remaining : ((trans.totalCost||0) - (trans.paid||0));
+    customer.balance -= oldNet;
+    
+    trans.items = newItems;
+    if(newDate) { trans.rawDate = newDate; trans.date = newDate; }
+    if(newTime) { trans.rawTime = newTime; trans.time = newTime; }
+    trans.days = newDays;
+    trans.total = newTotal;
+    trans.totalCost = newTotal;
+    trans.paid = newPaid;
+    trans.remaining = trans.totalCost - trans.paid;
+    
+    customer.balance += trans.remaining;
+    
+    trans.lastUpdated = Date.now();
+    customer.lastUpdated = Date.now();
+
+    await saveDataLocally();
+    window.closeModal('editTransactionModal');
+    window.updateCustomerBalanceDisplay(customer);
+    window.renderTransactions();
+}
+
+window.openReturnModal = function(id) {
+    document.getElementById('return-trans-id').value = id;
+    const trans = data.transactions.find(t => t.id === id);
+    const container = document.getElementById('return-items-container');
+    container.innerHTML = '';
+    const now = Date.now();
+
+    if(trans.itemsArray && trans.itemsArray.length > 0) {
+        trans.itemsArray.forEach((item, index) => {
+            const pendingQty = item.qty - item.returnedQty;
+            if(pendingQty > 0) {
+                const days = Math.max(1, Math.ceil((now - item.rentTimestamp) / 86400000));
+                const estimatedCost = days * item.price * pendingQty;
+                
+                let html = `
+                    <div class="rent-item-row" style="flex-direction:column; align-items:start; gap:5px;">
+                        <div style="font-weight:bold;">${item.name} (الكمية الكلية: ${item.qty} | المتبقي للإرجاع: ${pendingQty})</div>
+                        <div style="font-size:12px; color:gray;">الأيام المحسوبة: ${days} يوم | التكلفة التقديرية لهذه المادة: ${formatIQD(estimatedCost)} د.ع</div>
+                        <div style="display:flex; gap:5px; width:100%;">
+                            <input type="number" id="ret-qty-${index}" placeholder="الكمية المرجعة" value="${pendingQty}" min="1" max="${pendingQty}" style="margin-bottom:0; flex:1;">
+                            <input type="number" id="ret-pay-${index}" placeholder="مبلغ التسديد" value="${estimatedCost}" style="margin-bottom:0; flex:1;">
+                            <button class="btn-primary btn-small" onclick="window.processSingleReturn(${id}, ${index})" style="margin-bottom:0;">إرجاع</button>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML += html;
+            }
+        });
+    } else {
+        container.innerHTML = '<p>لا توجد تفاصيل مواد لهذه المعاملة القديمة.</p>';
+    }
+
+    const historyContainer = document.getElementById('return-history-container');
+    historyContainer.innerHTML = '';
+    
+    if(trans.returnHistory && trans.returnHistory.length > 0) {
+        trans.returnHistory.forEach(h => {
+            historyContainer.innerHTML += `
+                <div style="background: #f8f9fa; padding: 8px; margin-bottom: 5px; border-radius: 5px; border: 1px solid #e1e8ed; font-size: 13px;">
+                    <strong>${h.itemName}</strong> | تم إرجاع: ${h.qty} | تكلفة المادة: ${formatIQD(h.cost)} | تسديد: ${formatIQD(h.paid)} د.ع | التاريخ: ${h.date}
+                </div>
+            `;
+        });
+    } else {
+        historyContainer.innerHTML = '<p style="font-size: 13px; color: #7f8c8d;">لا توجد إرجاعات سابقة.</p>';
+    }
+
+    window.openModal('returnModal');
+}
+
+window.processSingleReturn = async function(transId, itemIndex) {
+    const trans = data.transactions.find(t => t.id === transId);
+    const customer = data.customers.find(c => c.id === trans.customerId);
+    const item = trans.itemsArray[itemIndex];
+    
+    const qtyInput = parseInt(document.getElementById(`ret-qty-${itemIndex}`).value) || 0;
+    const payInput = parseFloat(document.getElementById(`ret-pay-${itemIndex}`).value) || 0;
+    
+    if(qtyInput <= 0 || payInput < 0) {
+        alert("القيم غير صالحة"); return;
+    }
+
+    const days = Math.max(1, Math.ceil((Date.now() - item.rentTimestamp) / 86400000));
+    const cost = days * item.price * qtyInput;
+
+    item.returnedQty += qtyInput;
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('ar-IQ') + ' ' + now.toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    if(item.invType === 1) {
+        let invItem = data.inventory1.find(i => i.id === item.id);
+        if(invItem) invItem.qty += qtyInput;
+    } else {
+        let invItem = data.inventory2.find(i => i.id === item.id);
+        if(invItem) invItem.qty += qtyInput;
+    }
+
+    trans.totalCost = (trans.totalCost || 0) + cost;
+    trans.paid += payInput;
+    
+    customer.balance += (cost - payInput);
+
+    if(!trans.returnHistory) trans.returnHistory = [];
+    trans.returnHistory.push({
+        itemName: item.name,
+        qty: qtyInput,
+        cost: cost,
+        paid: payInput,
+        date: dateStr
+    });
+
+    const allReturned = trans.itemsArray.every(i => i.returnedQty >= i.qty);
+    if(allReturned) {
+        trans.status = 'completed';
+    } else {
+        trans.status = 'ongoing';
+    }
+
+    trans.lastUpdated = Date.now();
+    customer.lastUpdated = Date.now();
+
+    await saveDataLocally();
+    window.openReturnModal(transId); 
+    window.updateCustomerBalanceDisplay(customer);
+    window.renderTransactions();
+    window.renderInventory();
+}
+
+window.renderTransactions = function() {
+    const list = document.getElementById('transactions-list');
+    list.innerHTML = '';
+    
+    const custTrans = data.transactions.filter(t => t.customerId === currentCustomerId).reverse();
+
+    custTrans.forEach(t => {
+        const displayTime = t.time ? t.time : ''; 
+        
+        if(t.type === 'payment') {
+            list.innerHTML += `
+                <div class="card" style="border-right: 5px solid #27ae60;">
+                    <div class="card-info">
+                        <h4 style="color:#27ae60;">تسديد نقد</h4>
+                        <p>المبلغ: ${formatIQD(t.amount)} د.ع | التاريخ: ${t.date} ${displayTime}</p>
+                    </div>
+                    <div class="card-actions">
+                        <button class="btn-success btn-small" onclick="window.sharePaymentWhatsApp(${t.id})" style="margin-bottom:3px;">واتساب</button>
+                        <button class="btn-danger btn-small" onclick="window.deleteTransaction(${t.id})">حذف</button>
+                    </div>
+                </div>
+            `;
+        } else {
+            const itemsDisplay = t.itemsArray ? t.itemsArray.map(i => `${i.name}(${i.qty})`).join(' + ') : t.items;
+            const totalDisplay = t.totalCost || t.total || 0;
+            const remDisplay = t.remaining !== undefined ? t.remaining : (totalDisplay - t.paid);
+
+            list.innerHTML += `
+                <div class="card" style="border-right: 5px solid #2980b9;">
+                    <div class="card-info">
+                        <h4>تأجير: ${itemsDisplay}</h4>
+                        <p>التكلفة المحسوبة حتى الآن: ${formatIQD(totalDisplay)}</p>
+                        <p>المدفوع: ${formatIQD(t.paid)} | الباقي: ${formatIQD(remDisplay)}</p>
+                        <p>تاريخ: ${t.date} | الوقت: ${displayTime}</p>
+                    </div>
+                    <div class="card-actions">
+                        <button class="btn-success btn-small" onclick="window.shareRentWhatsApp(${t.id})" style="margin-bottom:3px;">واتساب</button>
+                        <button class="btn-primary btn-small" onclick="window.openReturnModal(${t.id})" style="margin-bottom:3px; background:linear-gradient(to bottom, #e67e22, #d35400);">الراجع</button>
+                        ${t.status === 'completed' ? `<span style="color: #27ae60; font-size:14px; font-weight:bold; text-align:center; margin-bottom:5px;">مكتملة ✔</span>` : ''}
+                        <button class="btn-warning btn-small" onclick="window.openEditTransactionModal(${t.id})" style="margin-bottom:3px;">تعديل</button>
+                        <button class="btn-danger btn-small" onclick="window.deleteTransaction(${t.id})">حذف</button>
+                    </div>
+                </div>
+            `;
+        }
+    });
+}
+
+window.sharePaymentWhatsApp = function(transId) {
+    const trans = data.transactions.find(t => t.id === transId);
+    const customer = data.customers.find(c => c.id === trans.customerId);
+    const msg = `مرحباً ${customer.name}،\nتم استلام دفعة نقدية (تسديد لحسابكم) بمبلغ: ${formatIQD(trans.amount)} د.ع.\nتاريخ الدفعة: ${trans.date} - ${trans.time}\n\nإجمالي الديون المتبقية بذمتكم حالياً هو: ${formatIQD(customer.balance)} د.ع.\n\nشكراً لتعاملكم مع محلات كريم لتأجير العدد اليدوية!`;
+    const encodedMessage = encodeURIComponent(msg);
+    const whatsappUrl = `https://wa.me/${customer.phone}?text=${encodedMessage}`;
+    window.open(whatsappUrl, '_blank');
+}
+
+window.shareRentWhatsApp = function(transId) {
+    const trans = data.transactions.find(t => t.id === transId);
+    const customer = data.customers.find(c => c.id === trans.customerId);
+    
+    let itemsDisplay = trans.itemsArray ? trans.itemsArray.map(i => `${i.name} (عدد ${i.qty})`).join(', ') : trans.items.replace(/<[^>]*>?/gm, ' ');
+    const totalDisplay = trans.totalCost || trans.total || 0;
+    const remDisplay = trans.remaining !== undefined ? trans.remaining : (totalDisplay - trans.paid);
+
+    const message = `*محلات كريم لتأجير العدد اليدوية*\n\nمرحباً ${customer.name}،\nتفاصيل التأجير:\nالمواد: ${itemsDisplay}\nالمبلغ المحسوب حتى الآن: ${formatIQD(totalDisplay)} د.ع\nالمدفوع: ${formatIQD(trans.paid)} د.ع\nالمتبقي من هذه الفاتورة: ${formatIQD(remDisplay)} د.ع\n\nإجمالي الباقي بذمتكم: ${formatIQD(customer.balance)} د.ع\n\nشكراً لتعاملكم معنا!`;
+    
+    const encodedMessage = encodeURIComponent(message);
+    const whatsappUrl = `https://wa.me/${customer.phone}?text=${encodedMessage}`;
+    
+    window.open(whatsappUrl, '_blank');
+}
+
+window.renderAlerts = function() {
+    const list = document.getElementById('alerts-list');
+    list.innerHTML = '';
+    
+    const now = Date.now();
+    let hasAlerts = false;
+
+    data.transactions.forEach(t => {
+        if(t.type === 'rent' && t.status === 'ongoing' && t.returnDateTimestamp && t.returnDateTimestamp < now) {
+            hasAlerts = true;
+            const customer = data.customers.find(c => c.id === t.customerId);
+            
+            const diffTime = Math.abs(now - t.returnDateTimestamp);
+            const delayDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+            list.innerHTML += `
+                <div class="card" style="border-right: 5px solid #e74c3c; background-color: #fdf0ed;">
+                    <div class="card-info">
+                        <h4 style="color:#c0392b;">تأخير: ${customer.name}</h4>
+                        <p>المواد: ${t.items.replace(/<[^>]*>?/gm, ' ')}</p>
+                        <p>مدة التأخير: ${delayDays} يوم</p>
+                        <p>الرقم: +${customer.phone}</p>
+                    </div>
+                    <div class="card-actions">
+                        <a href="https://wa.me/${customer.phone}" target="_blank" class="btn-success btn-small" style="text-decoration:none; text-align:center;">مراسلة</a>
+                    </div>
+                </div>
+            `;
+        }
+    });
+
+    if(!hasAlerts) {
+        list.innerHTML = '<p style="text-align:center; color:#7f8c8d; margin-top:20px; font-weight:bold;">لا توجد تنبيهات حالياً.</p>';
+    }
+}
+
+function renderUI() {
+    if(document.getElementById('tab-inventory').classList.contains('active')) window.renderInventory();
+    if(document.getElementById('tab-customers').classList.contains('active')) window.renderCustomers();
+    if(document.getElementById('customer-details-view').style.display === 'block') window.renderTransactions();
+}
+
+initData();
